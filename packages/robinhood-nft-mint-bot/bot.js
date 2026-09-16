@@ -130,6 +130,9 @@ function parseConfig() {
   if (mintPriceWei < 0n) {
     throw new SafetyError("MINT_PRICE_ETH cannot be negative.");
   }
+  if (mintPriceWei !== 0n) {
+    throw new SafetyError("MINT_PRICE_ETH must be exactly 0 for the SeaDrop public mint.");
+  }
 
   const maxFeePerGasGwei = required("MAX_FEE_PER_GAS_GWEI");
   const maxPriorityFeePerGasGwei = required("MAX_PRIORITY_FEE_PER_GAS_GWEI");
@@ -401,6 +404,52 @@ async function main() {
     return state.ethBalance;
   }
 
+  async function getCurrentTransactionFees() {
+    let feeData;
+    try {
+      feeData = await provider.getFeeData();
+    } catch (error) {
+      throw new SafetyError(`Could not read current network fee data: ${safeError(error)}`);
+    }
+
+    const networkMaxFeePerGas = feeData.maxFeePerGas ?? feeData.gasPrice;
+    const networkPriorityFeePerGas = feeData.maxPriorityFeePerGas ?? feeData.gasPrice;
+    if (networkMaxFeePerGas === null || networkMaxFeePerGas <= 0n) {
+      throw new SafetyError("RPC provider did not return a usable current max fee per gas.");
+    }
+    if (networkPriorityFeePerGas === null || networkPriorityFeePerGas < 0n) {
+      throw new SafetyError("RPC provider did not return a usable current priority fee per gas.");
+    }
+
+    const maxFeePerGas =
+      networkMaxFeePerGas < config.maxFeePerGas ? networkMaxFeePerGas : config.maxFeePerGas;
+    const maxPriorityFeePerGas = [
+      networkPriorityFeePerGas,
+      config.maxPriorityFeePerGas,
+      maxFeePerGas,
+    ].reduce((lowest, fee) => (fee < lowest ? fee : lowest));
+
+    if (maxFeePerGas <= 0n || maxPriorityFeePerGas < 0n || maxPriorityFeePerGas > maxFeePerGas) {
+      throw new SafetyError("Current network fee data cannot satisfy the configured gas ceilings.");
+    }
+
+    log(
+      `networkFees maxFeePerGasGwei=${ethers.formatUnits(maxFeePerGas, "gwei")} ` +
+        `maxPriorityFeePerGasGwei=${ethers.formatUnits(maxPriorityFeePerGas, "gwei")}`,
+    );
+    return { maxFeePerGas, maxPriorityFeePerGas };
+  }
+
+  function calculateMaximumGasCost(maxFeePerGas) {
+    const maximumGasCost = BigInt(config.gasLimit) * maxFeePerGas;
+    if (maximumGasCost > config.maxGasCostWei) {
+      throw new SafetyError(
+        `Maximum gas cost ${formatEth(maximumGasCost)} exceeds MAX_GAS_COST_ETH ${config.maxGasCostEth}.`,
+      );
+    }
+    return maximumGasCost;
+  }
+
   async function readNftBalance() {
     const data = balanceIface.encodeFunctionData(config.nftBalance.fragment, [wallet.address]);
     const result = await provider.call({ to: config.contractAddress, data });
@@ -537,11 +586,9 @@ async function main() {
     if (estimatedGas > configuredGasLimit) {
       throw new SafetyError(`Estimated gas ${estimatedGas.toString()} exceeds GAS_LIMIT ${config.gasLimit}.`);
     }
-    const maximumGasCost = configuredGasLimit * config.maxFeePerGas;
+    const fees = await getCurrentTransactionFees();
+    const maximumGasCost = calculateMaximumGasCost(fees.maxFeePerGas);
     log(`estimatedGas=${estimatedGas.toString()} maximumGasCostEth=${formatEth(maximumGasCost)}`);
-    if (maximumGasCost > config.maxGasCostWei) {
-      throw new SafetyError(`Maximum gas cost ${formatEth(maximumGasCost)} exceeds MAX_GAS_COST_ETH ${config.maxGasCostEth}.`);
-    }
 
     const ethBalance = await readEthBalance();
     const requiredBalance = maximumGasCost + config.mintPriceWei;
@@ -551,7 +598,7 @@ async function main() {
     }
 
     setState(STATES.READY_TO_MINT);
-    return { baselineBalance: nftBalance, data, mintArgs, estimatedGas, maximumGasCost };
+    return { baselineBalance: nftBalance, data, mintArgs, estimatedGas, fees, maximumGasCost };
   }
 
   async function resolveSubmittedTransaction(hash, baselineBalance) {
@@ -572,16 +619,22 @@ async function main() {
   }
 
   async function submitMint(preflightResult) {
+    const maximumGasCost = calculateMaximumGasCost(preflightResult.fees.maxFeePerGas);
     const transaction = {
       to: config.seaDropAddress,
       data: preflightResult.data,
       value: config.mintPriceWei,
       gasLimit: BigInt(config.gasLimit),
-      maxFeePerGas: config.maxFeePerGas,
-      maxPriorityFeePerGas: config.maxPriorityFeePerGas,
+      maxFeePerGas: preflightResult.fees.maxFeePerGas,
+      maxPriorityFeePerGas: preflightResult.fees.maxPriorityFeePerGas,
     };
     setState(STATES.TRANSACTION_SUBMITTED);
-    log(`mintAttempt=${state.currentAttempt} gasLimit=${config.gasLimit} mintPriceEth=${config.mintPriceEth}`);
+    log(
+      `mintAttempt=${state.currentAttempt} gasLimit=${config.gasLimit} ` +
+        `maxFeePerGasGwei=${ethers.formatUnits(preflightResult.fees.maxFeePerGas, "gwei")} ` +
+        `maxPriorityFeePerGasGwei=${ethers.formatUnits(preflightResult.fees.maxPriorityFeePerGas, "gwei")} ` +
+        `maximumGasCostEth=${formatEth(maximumGasCost)} mintPriceEth=${config.mintPriceEth}`,
+    );
     let response;
     try {
       response = await wallet.sendTransaction(transaction);

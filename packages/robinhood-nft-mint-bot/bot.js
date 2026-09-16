@@ -26,6 +26,8 @@ const TERMINAL_STATES = new Set([
   STATES.UNKNOWN_TRANSACTION_STATE,
 ]);
 
+const GAS_ESTIMATE_SAFETY_MARGIN_PERCENT = 10n;
+
 class SafetyError extends Error {
   constructor(message) {
     super(message);
@@ -56,6 +58,10 @@ function numberFromEnv(name, { integer = false, positive = false, defaultValue }
     throw new SafetyError(`${name} cannot be negative.`);
   }
   return parsed;
+}
+
+function optionalNumberFromEnv(name, options = {}) {
+  return raw[name]?.trim() ? numberFromEnv(name, options) : null;
 }
 
 function normalizeHumanReadableSignature(signature) {
@@ -134,18 +140,30 @@ function parseConfig() {
     throw new SafetyError("MINT_PRICE_ETH must be exactly 0 for the SeaDrop public mint.");
   }
 
-  const maxFeePerGasGwei = required("MAX_FEE_PER_GAS_GWEI");
-  const maxPriorityFeePerGasGwei = required("MAX_PRIORITY_FEE_PER_GAS_GWEI");
-  let maxFeePerGas;
-  let maxPriorityFeePerGas;
+  const maxFeePerGasGwei = raw.MAX_FEE_PER_GAS_GWEI?.trim() || null;
+  const maxPriorityFeePerGasGwei = raw.MAX_PRIORITY_FEE_PER_GAS_GWEI?.trim() || null;
+  let maxFeePerGas = null;
+  let maxPriorityFeePerGas = null;
   try {
-    maxFeePerGas = ethers.parseUnits(maxFeePerGasGwei, "gwei");
-    maxPriorityFeePerGas = ethers.parseUnits(maxPriorityFeePerGasGwei, "gwei");
+    if (maxFeePerGasGwei) maxFeePerGas = ethers.parseUnits(maxFeePerGasGwei, "gwei");
+    if (maxPriorityFeePerGasGwei) {
+      maxPriorityFeePerGas = ethers.parseUnits(maxPriorityFeePerGasGwei, "gwei");
+    }
   } catch (error) {
     throw new SafetyError(`Gas fee configuration is invalid: ${safeError(error)}`);
   }
-  if (maxFeePerGas <= 0n || maxPriorityFeePerGas < 0n || maxPriorityFeePerGas > maxFeePerGas) {
-    throw new SafetyError("MAX_PRIORITY_FEE_PER_GAS_GWEI must be non-negative and no greater than MAX_FEE_PER_GAS_GWEI.");
+  if (maxFeePerGas !== null && maxFeePerGas <= 0n) {
+    throw new SafetyError("MAX_FEE_PER_GAS_GWEI must be greater than zero when configured.");
+  }
+  if (maxPriorityFeePerGas !== null && maxPriorityFeePerGas < 0n) {
+    throw new SafetyError("MAX_PRIORITY_FEE_PER_GAS_GWEI cannot be negative.");
+  }
+  if (
+    maxFeePerGas !== null &&
+    maxPriorityFeePerGas !== null &&
+    maxPriorityFeePerGas > maxFeePerGas
+  ) {
+    throw new SafetyError("MAX_PRIORITY_FEE_PER_GAS_GWEI must be no greater than MAX_FEE_PER_GAS_GWEI.");
   }
 
   const watchStart = parseWatchTime(required("WATCH_START"), "WATCH_START");
@@ -215,11 +233,15 @@ function parseConfig() {
     maxPriorityFeePerGasGwei,
     maxFeePerGas,
     maxPriorityFeePerGas,
-    gasLimit: numberFromEnv("GAS_LIMIT", { integer: true, positive: true }),
-    maxGasCostEth: required("MAX_GAS_COST_ETH"),
+    gasLimit: optionalNumberFromEnv("GAS_LIMIT", { integer: true, positive: true }),
+    maxGasCostEth: raw.MAX_GAS_COST_ETH?.trim() || null,
     maxGasCostWei: (() => {
+      const value = raw.MAX_GAS_COST_ETH?.trim();
+      if (!value) return null;
       try {
-        return ethers.parseEther(required("MAX_GAS_COST_ETH"));
+        const parsed = ethers.parseEther(value);
+        if (parsed < 0n) throw new Error("must not be negative");
+        return parsed;
       } catch (error) {
         throw new SafetyError(`MAX_GAS_COST_ETH is invalid: ${safeError(error)}`);
       }
@@ -413,19 +435,18 @@ async function main() {
     }
 
     const networkMaxFeePerGas = feeData.maxFeePerGas ?? feeData.gasPrice;
-    const networkPriorityFeePerGas = feeData.maxPriorityFeePerGas ?? feeData.gasPrice;
+    const networkPriorityFeePerGas = feeData.maxPriorityFeePerGas ?? feeData.gasPrice ?? 0n;
     if (networkMaxFeePerGas === null || networkMaxFeePerGas <= 0n) {
       throw new SafetyError("RPC provider did not return a usable current max fee per gas.");
     }
-    if (networkPriorityFeePerGas === null || networkPriorityFeePerGas < 0n) {
-      throw new SafetyError("RPC provider did not return a usable current priority fee per gas.");
-    }
 
     const maxFeePerGas =
-      networkMaxFeePerGas < config.maxFeePerGas ? networkMaxFeePerGas : config.maxFeePerGas;
+      config.maxFeePerGas === null || networkMaxFeePerGas < config.maxFeePerGas
+        ? networkMaxFeePerGas
+        : config.maxFeePerGas;
     const maxPriorityFeePerGas = [
       networkPriorityFeePerGas,
-      config.maxPriorityFeePerGas,
+      ...(config.maxPriorityFeePerGas === null ? [] : [config.maxPriorityFeePerGas]),
       maxFeePerGas,
     ].reduce((lowest, fee) => (fee < lowest ? fee : lowest));
 
@@ -440,9 +461,9 @@ async function main() {
     return { maxFeePerGas, maxPriorityFeePerGas };
   }
 
-  function calculateMaximumGasCost(maxFeePerGas) {
-    const maximumGasCost = BigInt(config.gasLimit) * maxFeePerGas;
-    if (maximumGasCost > config.maxGasCostWei) {
+  function calculateMaximumGasCost(gasLimit, maxFeePerGas) {
+    const maximumGasCost = gasLimit * maxFeePerGas;
+    if (config.maxGasCostWei !== null && maximumGasCost > config.maxGasCostWei) {
       throw new SafetyError(
         `Maximum gas cost ${formatEth(maximumGasCost)} exceeds MAX_GAS_COST_ETH ${config.maxGasCostEth}.`,
       );
@@ -582,13 +603,24 @@ async function main() {
     } catch (error) {
       throw new SafetyError(`Gas estimation failed: ${safeError(error)}`);
     }
-    const configuredGasLimit = BigInt(config.gasLimit);
-    if (estimatedGas > configuredGasLimit) {
-      throw new SafetyError(`Estimated gas ${estimatedGas.toString()} exceeds GAS_LIMIT ${config.gasLimit}.`);
+
+    let gasLimit;
+    if (config.gasLimit !== null) {
+      gasLimit = BigInt(config.gasLimit);
+      if (estimatedGas > gasLimit) {
+        throw new SafetyError(`Estimated gas ${estimatedGas.toString()} exceeds GAS_LIMIT ${config.gasLimit}.`);
+      }
+    } else {
+      const safetyMargin = (estimatedGas * GAS_ESTIMATE_SAFETY_MARGIN_PERCENT + 99n) / 100n;
+      gasLimit = estimatedGas + safetyMargin;
     }
+
     const fees = await getCurrentTransactionFees();
-    const maximumGasCost = calculateMaximumGasCost(fees.maxFeePerGas);
-    log(`estimatedGas=${estimatedGas.toString()} maximumGasCostEth=${formatEth(maximumGasCost)}`);
+    const maximumGasCost = calculateMaximumGasCost(gasLimit, fees.maxFeePerGas);
+    log(
+      `estimatedGas=${estimatedGas.toString()} gasLimit=${gasLimit.toString()} ` +
+        `maximumGasCostEth=${formatEth(maximumGasCost)}`,
+    );
 
     const ethBalance = await readEthBalance();
     const requiredBalance = maximumGasCost + config.mintPriceWei;
@@ -598,7 +630,7 @@ async function main() {
     }
 
     setState(STATES.READY_TO_MINT);
-    return { baselineBalance: nftBalance, data, mintArgs, estimatedGas, fees, maximumGasCost };
+    return { baselineBalance: nftBalance, data, mintArgs, estimatedGas, gasLimit, fees, maximumGasCost };
   }
 
   async function resolveSubmittedTransaction(hash, baselineBalance) {
@@ -619,18 +651,18 @@ async function main() {
   }
 
   async function submitMint(preflightResult) {
-    const maximumGasCost = calculateMaximumGasCost(preflightResult.fees.maxFeePerGas);
+    const maximumGasCost = calculateMaximumGasCost(preflightResult.gasLimit, preflightResult.fees.maxFeePerGas);
     const transaction = {
       to: config.seaDropAddress,
       data: preflightResult.data,
       value: config.mintPriceWei,
-      gasLimit: BigInt(config.gasLimit),
+      gasLimit: preflightResult.gasLimit,
       maxFeePerGas: preflightResult.fees.maxFeePerGas,
       maxPriorityFeePerGas: preflightResult.fees.maxPriorityFeePerGas,
     };
     setState(STATES.TRANSACTION_SUBMITTED);
     log(
-      `mintAttempt=${state.currentAttempt} gasLimit=${config.gasLimit} ` +
+      `mintAttempt=${state.currentAttempt} gasLimit=${preflightResult.gasLimit.toString()} ` +
         `maxFeePerGasGwei=${ethers.formatUnits(preflightResult.fees.maxFeePerGas, "gwei")} ` +
         `maxPriorityFeePerGasGwei=${ethers.formatUnits(preflightResult.fees.maxPriorityFeePerGas, "gwei")} ` +
         `maximumGasCostEth=${formatEth(maximumGasCost)} mintPriceEth=${config.mintPriceEth}`,

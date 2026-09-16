@@ -18,3 +18,16 @@ expertMode = true
 [postMerge]
 path = "scripts/post-merge.sh"
 timeoutMs = 20000
+
+[userenv]
+
+[userenv.shared]
+TELEGRAM_BOT_TOKEN = "8805106710:AAGiNnBq0n_ZTQxmGWq5qSNvjAoGj3RP7GA"
+TELEGRAM_USER_ID = "5738769100"
+RPC_URL = "https://rpc.mainnet.chain.robinhood.com"
+CONTRACT_ADDRESS = "0x116EaA62241751E0c98dA43d458600c6C17cD361"
+MINT_FUNCTION_SIGNATURE = "mintPublic(address,address,address,uint256)"
+MINT_PRICE_ETH = "0"
+MAX_PER_WALLET = "1"
+SEADROP_ADDRESS = "0x00005EA00Ac477B103CE78506496e8C2dE24bf5"
+MINT_FEE_RECIPIENT = "0x0000a26b00c1F0DF003000390027140000fAa719"

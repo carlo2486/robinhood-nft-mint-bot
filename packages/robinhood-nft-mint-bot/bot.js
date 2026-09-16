@@ -82,6 +82,17 @@ function parseFunctionFragment(value, label) {
   return { iface, fragment: functions[0], signature: normalized };
 }
 
+function parseNftBalanceFragment(value, label) {
+  const normalized = normalizeHumanReadableSignature(value);
+  if (normalized === "balanceOf(address)") {
+    return parseFunctionFragment(
+      "function balanceOf(address) view returns (uint256)",
+      label,
+    );
+  }
+  return parseFunctionFragment(value, label);
+}
+
 function parseOptionalFunctionFragment(value, label) {
   const trimmed = value?.trim();
   return trimmed ? parseFunctionFragment(trimmed, label) : null;
@@ -102,7 +113,7 @@ function parseWatchTime(value, label) {
 
 function parseConfig() {
   const mintFunction = parseFunctionFragment(required("MINT_FUNCTION_SIGNATURE"), "MINT_FUNCTION_SIGNATURE");
-  const nftBalance = parseFunctionFragment(required("NFT_BALANCE_SIGNATURE"), "NFT_BALANCE_SIGNATURE");
+  const nftBalance = parseNftBalanceFragment(required("NFT_BALANCE_SIGNATURE"), "NFT_BALANCE_SIGNATURE");
   const triggerType = required("MINT_TRIGGER_TYPE").toLowerCase();
   const triggerValue = required("MINT_TRIGGER_VALUE");
   if (!["function", "timestamp", "block"].includes(triggerType)) {
@@ -154,12 +165,28 @@ function parseConfig() {
     throw new SafetyError(`CONTRACT_ADDRESS is invalid: ${safeError(error)}`);
   }
 
+  let seaDropAddress;
+  try {
+    seaDropAddress = ethers.getAddress(required("SEADROP_ADDRESS"));
+  } catch (error) {
+    throw new SafetyError(`SEADROP_ADDRESS is invalid: ${safeError(error)}`);
+  }
+
+  let feeRecipient;
+  try {
+    feeRecipient = ethers.getAddress(required("MINT_FEE_RECIPIENT"));
+  } catch (error) {
+    throw new SafetyError(`MINT_FEE_RECIPIENT is invalid: ${safeError(error)}`);
+  }
+
   const config = {
     telegramBotToken: required("TELEGRAM_BOT_TOKEN"),
     telegramUserId: required("TELEGRAM_USER_ID"),
     privateKey: required("PRIVATE_KEY"),
     rpcUrl: required("RPC_URL"),
     contractAddress,
+    seaDropAddress,
+    feeRecipient,
     wallet,
     mintFunction,
     nftBalance,
@@ -207,6 +234,11 @@ function parseConfig() {
   if (config.totalMints !== 1) {
     throw new SafetyError("TOTAL_MINTS must be exactly 1.");
   }
+  if (config.mintFunction.fragment.format() !== "mintPublic(address,address,address,uint256)") {
+    throw new SafetyError(
+      "MINT_FUNCTION_SIGNATURE must be exactly mintPublic(address,address,address,uint256).",
+    );
+  }
   if (config.mintFunction.fragment.stateMutability === "view" || config.mintFunction.fragment.stateMutability === "pure") {
     throw new SafetyError("MINT_FUNCTION_SIGNATURE must be a state-changing function.");
   }
@@ -220,17 +252,6 @@ function parseConfig() {
   }
   if (config.trigger.function && !["view", "pure"].includes(config.trigger.function.fragment.stateMutability)) {
     throw new SafetyError("MINT_TRIGGER_VALUE must be a view or pure function signature.");
-  }
-  if (config.mintFunction.fragment.inputs.length > 1) {
-    throw new SafetyError(
-      "This implementation only submits exact mint functions with zero inputs or one uint quantity input. Supply a purpose-built authorization flow instead of guessing extra parameters.",
-    );
-  }
-  if (
-    config.mintFunction.fragment.inputs.length === 1 &&
-    !config.mintFunction.fragment.inputs[0].type.startsWith("uint")
-  ) {
-    throw new SafetyError("A one-argument mint function must accept an unsigned integer quantity.");
   }
   if (config.nftBalance.fragment.inputs.length !== 1 || config.nftBalance.fragment.inputs[0].type !== "address") {
     throw new SafetyError("NFT_BALANCE_SIGNATURE must accept exactly one address argument.");
@@ -494,13 +515,18 @@ async function main() {
     const soldOut = await readOptionalBoolean(config.soldOutFunction, "sold-out status");
     if (soldOut === true) throw new SafetyError("Collection is sold out.");
 
-    const mintArgs = config.mintFunction.fragment.inputs.length === 0 ? [] : [1];
+    const mintArgs = [
+      config.contractAddress,
+      config.feeRecipient,
+      ethers.ZeroAddress,
+      1n,
+    ];
     const data = mintIface.encodeFunctionData(config.mintFunction.fragment, mintArgs);
     let estimatedGas;
     try {
       estimatedGas = await provider.estimateGas({
         from: wallet.address,
-        to: config.contractAddress,
+        to: config.seaDropAddress,
         data,
         value: config.mintPriceWei,
       });
@@ -547,7 +573,7 @@ async function main() {
 
   async function submitMint(preflightResult) {
     const transaction = {
-      to: config.contractAddress,
+      to: config.seaDropAddress,
       data: preflightResult.data,
       value: config.mintPriceWei,
       gasLimit: BigInt(config.gasLimit),
